@@ -10,8 +10,8 @@ use axum::{extract::State, http::HeaderMap, Json};
 use chroma_error::{ChromaError, ErrorCodes};
 use chroma_sysdb::SysDb;
 use chroma_types::{
-    Collection, CollectionUuid, CreateDatabaseError, DatabaseName, KnnIndex, Metadata,
-    MetadataValue, Schema, CHROMA_GROUP_CHUNK_SIBLINGS_KEY,
+    slack_raw_schema, Collection, CollectionUuid, CreateDatabaseError, DatabaseName, KnnIndex,
+    Metadata, MetadataValue, Schema, CHROMA_GROUP_CHUNK_SIBLINGS_KEY, SLACK_RAW_COLLECTION_NAME,
 };
 use frontend_core::{
     attached_function_ops,
@@ -36,8 +36,12 @@ pub struct FoundationInitResponse {
     pub currents_collection_id: String,
     pub file_uploads_collection_id: String,
     pub agent_sessions_collection_id: String,
+    /// Id of the UNINDEXED `slack_raw` append-log collection. Created
+    /// record-only and wired as an attached-function input in place of the
+    /// old indexed `slack` source.
+    pub slack_raw_collection_id: String,
     /// Source collection name -> id for each ensured source collection
-    /// (slack, notion, …). Each carries the chunk-sibling grouping flag.
+    /// (notion, gdrive, …). Each carries the chunk-sibling grouping flag.
     pub source_collection_ids: std::collections::HashMap<String, String>,
 }
 
@@ -159,12 +163,12 @@ pub async fn foundation_init(
     )
     .await?;
 
-    // Source collections are the attached function's *input*. They carry
-    // the chunk-sibling grouping flag so a job's chunk records stay in one
-    // partition and the trailing end-of-job marker on `{base}-0` is
-    // observed after every sibling chunk (ADR 0001 §6). All sources share
-    // one async attached function, and extra sources are added via
-    // `add_input()`.
+    // Indexed source collections (notion, gdrive, …) are *extra* inputs to the
+    // attached function. They carry the chunk-sibling grouping flag so a job's
+    // chunk records stay in one partition and the trailing end-of-job marker on
+    // `{base}-0` is observed after every sibling chunk (ADR 0001 §6). All
+    // inputs share one async attached function; extras are added via
+    // `add_input()` below.
     let mut source_collection_ids = HashMap::new();
     let mut source_collections = Vec::new();
     for source_name in &foundation_cfg.source_collections {
@@ -182,39 +186,60 @@ pub async fn foundation_init(
         source_collection_ids.insert(source_name.clone(), source.collection_id.to_string());
     }
 
-    if let Some((base_source_name, base_source_id)) = source_collections.first() {
-        ensure_attached_function(
-            &mut sysdb,
-            tenant.clone(),
-            *base_source_id,
-            base_source_name,
-            foundation_cfg,
-        )
-        .await?;
+    // Real-time Slack messages land in `slack_raw` as raw, single, UNINDEXED
+    // records (an append log) — batching/rendering/generation are deferred to
+    // the attached function downstream. Unlike the indexed sources it is
+    // created record-only (no embedding function, no dimension). It also does
+    // NOT carry the chunk-sibling grouping flag: each message is its own
+    // single record, so there are no sibling chunks to keep in one partition.
+    let slack_raw = ensure_record_only_collection(
+        &mut sysdb,
+        tenant.clone(),
+        db_name.clone(),
+        SLACK_RAW_COLLECTION_NAME,
+        None,
+    )
+    .await?;
 
-        for (_, source_collection_id) in source_collections.iter().skip(1) {
-            attached_function_ops::add_attached_function_input(
-                &mut sysdb,
-                foundation_attached_function_name(),
-                *base_source_id,
-                *source_collection_id,
-                db_name.clone(),
-            )
-            .await?;
-        }
+    // `slack_raw` is the attached function's *base* input, in place of the old
+    // indexed `slack` source. It is the right base for two reasons:
+    //  - it is always created (above), so the function is always created and
+    //    every input is wired even when `source_collections` is empty; and
+    //  - it is a fixed collection, so the base — which keys the function's
+    //    identity in sysdb — is stable across `source_collections` changes,
+    //    keeping repeated `/init` calls idempotent.
+    // Its source_kind resolves to `slack`, so the generation contract is
+    // unchanged from the old `slack` base.
+    ensure_attached_function(
+        &mut sysdb,
+        tenant.clone(),
+        slack_raw.collection_id,
+        SLACK_RAW_COLLECTION_NAME,
+        foundation_cfg,
+    )
+    .await?;
 
-        // Wire the per-user coding-agent traces collection into the same
-        // sources->wiki function so synced agent sessions flow into the
-        // shared wiki output alongside slack/notion.
+    // Add the indexed sources and the per-user coding-agent traces collection
+    // as extra inputs to the same sources->wiki function, so they flow into the
+    // shared wiki output alongside slack_raw.
+    for (_, source_collection_id) in &source_collections {
         attached_function_ops::add_attached_function_input(
             &mut sysdb,
             foundation_attached_function_name(),
-            *base_source_id,
-            agent_sessions.collection_id,
+            slack_raw.collection_id,
+            *source_collection_id,
             db_name.clone(),
         )
         .await?;
     }
+    attached_function_ops::add_attached_function_input(
+        &mut sysdb,
+        foundation_attached_function_name(),
+        slack_raw.collection_id,
+        agent_sessions.collection_id,
+        db_name.clone(),
+    )
+    .await?;
 
     tracing::info!(
         tenant = %tenant,
@@ -232,13 +257,14 @@ pub async fn foundation_init(
         currents_collection_id: currents.collection_id.to_string(),
         file_uploads_collection_id: file_uploads.collection_id.to_string(),
         agent_sessions_collection_id: agent_sessions.collection_id.to_string(),
+        slack_raw_collection_id: slack_raw.collection_id.to_string(),
         source_collection_ids,
     }))
 }
 
 /// Dense-index dimensionality to pin a source collection to.
 ///
-/// Most sources (slack, notion) carry 1024-dim vectors supplied by the
+/// Most sources (e.g. notion) carry 1024-dim vectors supplied by the
 /// writer. The Google Drive source instead carries no vectors of its own —
 /// the caller upserts records without embeddings — so it is pinned to a
 /// single dimension (with no embedding function, like currents /
@@ -490,6 +516,64 @@ async fn ensure_collection(
     embedding_functions: CollectionEmbeddingFunctions,
 ) -> Result<Collection, ServerError> {
     let schema = foundation_collection_schema(embedding_functions);
+    create_planned_collection(
+        sysdb,
+        tenant,
+        database_name,
+        collection_name,
+        schema,
+        metadata,
+        dimension,
+    )
+    .await
+}
+
+/// Ensure an UNINDEXED, record-only collection (e.g. `slack_raw`). Mirrors
+/// [`ensure_collection`] but uses the shared record-only schema, no embedding
+/// function, and no pinned dimension — records are stored verbatim and never
+/// indexed at ingest. The schema spec is shared with hosted-chroma's sync
+/// service via [`chroma_types::slack_raw_schema`].
+#[tracing::instrument(
+    name = "ensure_record_only_collection",
+    skip_all,
+    fields(collection = %collection_name, database = %database_name.as_ref()),
+    err(Display)
+)]
+async fn ensure_record_only_collection(
+    sysdb: &mut SysDb,
+    tenant: String,
+    database_name: DatabaseName,
+    collection_name: &str,
+    metadata: Option<Metadata>,
+) -> Result<Collection, ServerError> {
+    create_planned_collection(
+        sysdb,
+        tenant,
+        database_name,
+        collection_name,
+        slack_raw_schema(),
+        metadata,
+        // Record-only: no dense vectors are written, so there is no dimension
+        // to pin (mirrors currents / wiki_revisions, but with all indexing off).
+        None,
+    )
+    .await
+}
+
+/// Shared core for the `ensure_*_collection` helpers: plan a fresh
+/// distributed-mode collection from the given `schema` and hand it to sysdb.
+/// `GET_OR_CREATE` keeps it idempotent in a single round trip, so a transient
+/// sysdb failure is safe to retry; the plan (collection id + segments +
+/// config) is fixed up front and reused across attempts.
+async fn create_planned_collection(
+    sysdb: &mut SysDb,
+    tenant: String,
+    database_name: DatabaseName,
+    collection_name: &str,
+    schema: Schema,
+    metadata: Option<Metadata>,
+    dimension: Option<i32>,
+) -> Result<Collection, ServerError> {
     let plan = plan_create_collection(
         None,
         Some(schema),
@@ -499,9 +583,6 @@ async fn ensure_collection(
         KnnIndex::Spann,
         TenantFeatureFlags::default(),
     )?;
-    // `GET_OR_CREATE` makes this idempotent in a single round trip, so a
-    // transient sysdb failure is safe to retry. The plan (collection id +
-    // segments + config) is fixed up front and reused across attempts.
     let collection_id = plan.collection_id;
     let collection = retry_transient(|| {
         let mut sysdb = sysdb.clone();
@@ -547,9 +628,72 @@ mod tests {
     fn gdrive_source_is_single_dimension_others_are_1024() {
         assert_eq!(source_dimension("gdrive"), Some(1));
         assert_eq!(source_dimension("gdrive_master"), Some(1));
-        assert_eq!(source_dimension("slack"), Some(1024));
         assert_eq!(source_dimension("notion"), Some(1024));
         // Unknown sources fall back to the default 1024 dims.
         assert_eq!(source_dimension("unknown_source"), Some(1024));
+    }
+
+    /// `slack_raw` is the attached function's base input, so its source_kind
+    /// must resolve to `slack` — that keeps the generation contract identical
+    /// to the old `slack` base and guarantees `ensure_attached_function` won't
+    /// error on an unknown source kind.
+    #[test]
+    fn slack_raw_maps_to_slack_source_kind() {
+        assert_eq!(
+            source_kind_for_collection_name(SLACK_RAW_COLLECTION_NAME).unwrap(),
+            "slack"
+        );
+    }
+
+    /// `slack_raw` is created through the same planner path `/init` uses for
+    /// the record-only helper. Assert the reconciled plan keeps every index
+    /// disabled — i.e. the collection really is record-only after planning,
+    /// not just before `reconcile_schema_and_config` runs.
+    #[test]
+    fn slack_raw_plan_is_record_only() {
+        let plan = plan_create_collection(
+            None,
+            Some(slack_raw_schema()),
+            ExecutorKind::Distributed,
+            &supported_segment_types(ExecutorKind::Distributed),
+            true,
+            KnnIndex::Spann,
+            TenantFeatureFlags::default(),
+        )
+        .expect("planning the record-only slack_raw schema must succeed");
+
+        let reconciled = plan
+            .schema
+            .as_ref()
+            .expect("plan must carry a reconciled schema when enable_schema=true");
+
+        assert!(
+            !reconciled.is_sparse_index_enabled(),
+            "slack_raw must have no sparse vector index after planning"
+        );
+        assert!(
+            !reconciled.is_fts_enabled(),
+            "slack_raw must have no FTS index after planning"
+        );
+
+        let float_list = reconciled
+            .defaults
+            .float_list
+            .as_ref()
+            .expect("schema defaults must carry a dense vector index entry");
+        assert!(
+            !float_list.vector_index.as_ref().unwrap().enabled,
+            "slack_raw must have no dense vector index after planning"
+        );
+
+        let string = reconciled
+            .defaults
+            .string
+            .as_ref()
+            .expect("schema defaults must carry a string value type");
+        assert!(
+            !string.string_inverted_index.as_ref().unwrap().enabled,
+            "slack_raw must have no string inverted index after planning"
+        );
     }
 }

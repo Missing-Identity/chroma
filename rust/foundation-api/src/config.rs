@@ -112,11 +112,11 @@ impl FoundationConfig {
         "agent_sessions".to_string()
     }
     fn default_source_collections() -> Vec<String> {
-        vec![
-            "slack".to_string(),
-            "notion".to_string(),
-            "gdrive".to_string(),
-        ]
+        // `slack` was removed in favor of the UNINDEXED `slack_raw`
+        // append-log collection, which `/init` creates record-only and wires
+        // in separately (see `slack_raw` module). The collections listed here
+        // stay indexed.
+        vec!["notion".to_string(), "gdrive".to_string()]
     }
     fn default_function_name() -> String {
         "http_generate".to_string()
@@ -155,5 +155,24 @@ impl Default for FoundationConfig {
 impl FoundationApiConfig {
     pub fn load_from_path(path: &str) -> Self {
         load_yaml_with_env(path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_sources_drop_slack_keep_indexed_sources() {
+        let sources = FoundationConfig::default().source_collections;
+        // `slack` was replaced by the UNINDEXED `slack_raw` append-log
+        // collection, which is created/wired separately in `/init`, so it
+        // must not appear among the indexed source collections.
+        assert!(
+            !sources.iter().any(|s| s == "slack"),
+            "slack must no longer be a default indexed source: {sources:?}"
+        );
+        assert!(sources.iter().any(|s| s == "notion"));
+        assert!(sources.iter().any(|s| s == "gdrive"));
     }
 }
