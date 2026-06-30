@@ -37,6 +37,7 @@ use chroma_agent::{
 use events::{action_event, action_text, observation_event, AgentSseEvent};
 
 use crate::agent_tools::{SearchTool, SubagentSearchTool};
+use crate::routes::links::page_link_instructions;
 use crate::routes::subagent_search::SubagentSearchCreds;
 use crate::routes::{caller_token, to_sse_event, whoami::whoami_and_authorize};
 use crate::wiki::embed::WikiEmbedder;
@@ -157,7 +158,9 @@ pub async fn foundation_agent(
 /// `subagent_search` tool, which is registered only when the dependency is
 /// configured. The Anthropic model reuses the shared HTTP pool, and the system
 /// prompt is taken from the request (which defaults to [`DEFAULT_SYSTEM_PROMPT`]
-/// when the caller omits it).
+/// when the caller omits it). When `foundation_ui_origin` is configured, page
+/// link instructions are appended so the agent cites pages as resolvable
+/// Markdown links (mirroring the MCP `ask_foundation` tool).
 async fn build_agent(
     server: &FoundationApiServer,
     headers: &HeaderMap,
@@ -201,7 +204,21 @@ async fn build_agent(
         .map_err(|err| AgentRouteError::Inference(err.to_string()))?
         .with_client(server.shared_http_client.clone());
 
-    Ok(Agent::new(toolset, Box::new(inference)).with_system_prompt(request.system.clone()))
+    // When the UI origin is configured, append guidance that teaches the agent
+    // to cite pages as resolvable redirect links; otherwise use the caller's
+    // prompt as-is. Mirrors the MCP `ask_foundation` wiring.
+    let link_instructions = server
+        .config
+        .foundation
+        .foundation_ui_origin
+        .as_deref()
+        .and_then(|origin| page_link_instructions(origin, tenant));
+    let system = match link_instructions {
+        Some(instructions) => request.system.clone() + &instructions,
+        None => request.system.clone(),
+    };
+
+    Ok(Agent::new(toolset, Box::new(inference)).with_system_prompt(system))
 }
 
 /// Runs the same agent loop as `/api/agent` and returns the terminal answer.

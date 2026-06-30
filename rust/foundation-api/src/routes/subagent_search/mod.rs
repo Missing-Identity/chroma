@@ -342,13 +342,23 @@ pub(crate) async fn subagent_search_text(
     Ok(format_ranked_documents(&documents))
 }
 
-/// Renders ranked documents (most-relevant first) into a numbered text block of
-/// `id` + justification lines for the model to read.
+/// Renders ranked documents (most-relevant first) into a numbered text block
+/// for the model to read. Each line carries the record `id` plus the page
+/// `slug=` it resolves to — matching the `search` tool's output so the agent
+/// can cite results from both tools the same way.
 fn format_ranked_documents(documents: &[events::RankedDocument]) -> String {
     documents
         .iter()
         .enumerate()
-        .map(|(i, doc)| format!("{}. {}\n   {}", i + 1, doc.id, doc.justification))
+        .map(|(i, doc)| {
+            format!(
+                "{}. {} slug={}\n   {}",
+                i + 1,
+                doc.id,
+                doc.slug(),
+                doc.justification
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }

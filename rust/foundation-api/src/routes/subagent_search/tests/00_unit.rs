@@ -144,6 +144,23 @@ into the index.
 }
 
 #[test]
+fn ranked_document_slug_strips_trailing_chunk_suffix() {
+    let doc = |id: &str| RankedDocument {
+        id: id.to_string(),
+        justification: String::new(),
+    };
+    // The chunk id is the last `-<int>` segment; stripping it recovers the
+    // page slug even when the slug itself contains hyphens.
+    assert_eq!(doc("onboarding-0").slug(), "onboarding");
+    assert_eq!(doc("getting-started-12").slug(), "getting-started");
+    // Category slugs keep their `:` and only shed the chunk suffix.
+    assert_eq!(doc("category:eng-3").slug(), "category:eng");
+    // No trailing numeric segment -> fall back to the full id.
+    assert_eq!(doc("no-chunk-suffix").slug(), "no-chunk-suffix");
+    assert_eq!(doc("plainid").slug(), "plainid");
+}
+
+#[test]
 fn parses_no_documents_from_unstructured_text() {
     assert!(parse_ranked_documents("I could not find anything relevant.").is_empty());
 }
