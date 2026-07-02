@@ -14,9 +14,7 @@ use thiserror::Error;
 use tracing::span;
 
 use crate::execution::orchestration::compact::CompactionContext;
-use crate::execution::orchestration::function_execution::{
-    FunctionExecutionContext, FunctionExecutionInput,
-};
+use crate::execution::orchestration::function_execution::FunctionExecutionContext;
 use crate::fn_consumer::config::FnConsumerConfig;
 use crate::work_queue::work_queue_client::WorkQueueClient;
 
@@ -154,7 +152,7 @@ impl FnConsumerManager {
     async fn dispatch_batch(
         &self,
         fn_id: AttachedFunctionUuid,
-        batch: Vec<FunctionExecutionInput>,
+        batch: Vec<(CollectionUuid, i64)>,
     ) -> Result<(), DispatchError> {
         let Some(dispatcher) = self.context.dispatcher.clone() else {
             tracing::error!("Dispatcher not set on FnConsumerManager");
@@ -257,19 +255,16 @@ impl FnConsumerManager {
                 );
                 continue;
             };
-            work_items.push((fn_id, input_coll_id, item.compaction_offset));
+            work_items.push((fn_id, input_coll_id, item.completion_offset));
         }
 
-        let mut grouped_work_items: HashMap<AttachedFunctionUuid, Vec<FunctionExecutionInput>> =
+        let mut grouped_work_items: HashMap<AttachedFunctionUuid, Vec<(CollectionUuid, i64)>> =
             HashMap::new();
-        for (fn_id, input_coll_id, compaction_offset) in work_items {
+        for (fn_id, input_coll_id, completion_offset) in work_items {
             grouped_work_items
                 .entry(fn_id)
                 .or_default()
-                .push(FunctionExecutionInput {
-                    collection_id: input_coll_id,
-                    queue_compaction_offset: compaction_offset,
-                });
+                .push((input_coll_id, completion_offset));
         }
 
         let mut batches_to_process = Vec::new();
@@ -286,10 +281,15 @@ impl FnConsumerManager {
             // TODO(tanujnay112): Cap how many input collections a single function
             // execution can process at once instead of only relying on
             // get_work_batch_size to indirectly bound this batch.
-            if !items.is_empty() {
+            let mut batch = Vec::new();
+            for (input_coll_id, completion_offset) in items {
+                batch.push((input_coll_id, completion_offset));
+            }
+
+            if !batch.is_empty() {
                 self.in_progress
                     .insert(fn_id, InProgressFn::new(self.context.job_expiry_seconds));
-                batches_to_process.push((fn_id, items));
+                batches_to_process.push((fn_id, batch));
                 remaining_capacity -= 1;
             }
         }

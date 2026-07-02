@@ -165,7 +165,6 @@ impl WorkQueueService for WorkQueueServer {
                 fn_id: record.fn_id.to_string(),
                 input_coll_id: record.input_coll_id.to_string(),
                 completion_offset: record.completion_offset,
-                compaction_offset: record.compaction_offset,
             })
             .collect();
 
