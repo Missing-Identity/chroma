@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 pub(crate) mod agent_tools;
 pub mod config;
+pub(crate) mod foundation_chroma;
 pub(crate) mod routes;
 pub mod server;
 pub mod trajectories;
