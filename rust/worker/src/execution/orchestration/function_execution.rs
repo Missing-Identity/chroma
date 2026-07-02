@@ -42,8 +42,8 @@ pub struct FunctionExecutionContext {
     compaction_context: CompactionContext,
 }
 
-fn has_reached_queue_frontier(completion_offset: i64, queue_compaction_offset: i64) -> bool {
-    queue_compaction_offset > 0 && completion_offset >= queue_compaction_offset
+fn has_reached_current_target(completion_offset: i64, target_log_position: i64) -> bool {
+    completion_offset >= target_log_position
 }
 
 impl FunctionExecutionContext {
@@ -197,13 +197,16 @@ impl FunctionExecutionContext {
                 .ok_or(CompactionError::InvariantViolation(
                     "Missing resolved attached function state for fn-consumer input collection",
                 ))?;
+            let current_target_log_position =
+                collection_data.collection_info.collection.log_position;
 
-            if has_reached_queue_frontier(completion_offset, input.queue_compaction_offset) {
+            if has_reached_current_target(completion_offset, current_target_log_position) {
                 tracing::info!(
                     collection_id = %input.collection_id,
                     completion_offset,
                     queue_compaction_offset = input.queue_compaction_offset,
-                    "Skipping stale fn-consumer work item because attached function is already at or beyond the queued frontier"
+                    current_target_log_position,
+                    "Skipping stale fn-consumer work item because attached function is already at or beyond the current resolved target"
                 );
                 continue;
             }
@@ -245,15 +248,15 @@ impl FunctionExecutionContext {
 
 #[cfg(test)]
 mod tests {
-    use super::has_reached_queue_frontier;
+    use super::has_reached_current_target;
 
     #[test]
-    fn zero_queue_frontier_is_not_treated_as_completed_work() {
-        assert!(!has_reached_queue_frontier(0, 0));
+    fn completion_below_current_target_still_has_work() {
+        assert!(!has_reached_current_target(550, 850));
     }
 
     #[test]
-    fn positive_queue_frontier_still_treats_equality_as_complete() {
-        assert!(has_reached_queue_frontier(40, 40));
+    fn completion_equal_to_current_target_is_complete() {
+        assert!(has_reached_current_target(550, 550));
     }
 }
