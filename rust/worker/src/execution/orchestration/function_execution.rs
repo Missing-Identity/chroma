@@ -1,5 +1,3 @@
-use std::cell::OnceCell;
-
 use chroma_system::System;
 use chroma_types::{AttachedFunction, AttachedFunctionUuid, CollectionUuid, DatabaseName};
 use uuid::Uuid;
@@ -12,9 +10,16 @@ use super::{
 };
 
 #[derive(Debug, Clone)]
+pub struct FunctionExecutionInput {
+    pub collection_id: CollectionUuid,
+    pub queue_compaction_offset: i64,
+}
+
+#[derive(Debug, Clone)]
 pub struct FunctionInputCollectionData {
     pub collection_info: CollectionCompactInfo,
     pub materialized_log_data: Vec<MaterializeLogOutput>,
+    pub resolved_attached_functions: Vec<AttachedFunction>,
 }
 
 #[derive(Debug, Clone)]
@@ -44,28 +49,21 @@ impl FunctionExecutionContext {
         }
     }
 
-    fn build_log_fetch_context(
-        mut compaction_context: CompactionContext,
-        log_start_offset: i64,
-    ) -> CompactionContext {
-        compaction_context.collection_info = OnceCell::new();
-        compaction_context.log_start_offset = Some(log_start_offset);
-        compaction_context
-    }
-
     async fn fetch_function_input_logs(
         mut log_fetch_context: CompactionContext,
         collection_id: CollectionUuid,
         database_name: chroma_types::DatabaseName,
         system: System,
         use_compacted_logs: bool,
+        attached_function_id: AttachedFunctionUuid,
     ) -> Result<LogFetchOrchestratorResponse, CompactionError> {
         Ok(log_fetch_context
-            .run_get_logs(
+            .run_get_logs_for_attached_function(
                 collection_id,
                 database_name.clone(),
                 system.clone(),
                 use_compacted_logs,
+                attached_function_id,
             )
             .await?)
     }
@@ -73,25 +71,27 @@ impl FunctionExecutionContext {
     async fn fetch_function_input_collection_data(
         compaction_context: CompactionContext,
         collection_id: CollectionUuid,
-        completion_offset: i64,
+        attached_function_id: AttachedFunctionUuid,
         database_name: DatabaseName,
         system: System,
     ) -> Result<FunctionInputCollectionData, CompactionError> {
-        let log_fetch_context =
-            Self::build_log_fetch_context(compaction_context, completion_offset);
+        let log_fetch_context = compaction_context;
         let result = Self::fetch_function_input_logs(
             log_fetch_context.clone(),
             collection_id,
             database_name.clone(),
             system.clone(),
             false,
+            attached_function_id,
         )
         .await?;
 
-        let (materialized_log_data, collection_info) = match result {
-            LogFetchOrchestratorResponse::Success(success) => {
-                (success.materialized, success.collection_info)
-            }
+        let (materialized_log_data, collection_info, resolved_attached_functions) = match result {
+            LogFetchOrchestratorResponse::Success(success) => (
+                success.materialized,
+                success.collection_info,
+                success.resolved_attached_functions,
+            ),
             LogFetchOrchestratorResponse::RequireFunctionBackfill(_) => {
                 match Self::fetch_function_input_logs(
                     log_fetch_context,
@@ -99,12 +99,15 @@ impl FunctionExecutionContext {
                     database_name,
                     system,
                     true,
+                    attached_function_id,
                 )
                 .await?
                 {
-                    LogFetchOrchestratorResponse::Success(success) => {
-                        (success.materialized, success.collection_info)
-                    }
+                    LogFetchOrchestratorResponse::Success(success) => (
+                        success.materialized,
+                        success.collection_info,
+                        success.resolved_attached_functions,
+                    ),
                     LogFetchOrchestratorResponse::RequireCompactionOffsetRepair(_)
                     | LogFetchOrchestratorResponse::RequireFunctionBackfill(_) => {
                         return Err(CompactionError::InvariantViolation(
@@ -123,14 +126,48 @@ impl FunctionExecutionContext {
         Ok(FunctionInputCollectionData {
             collection_info,
             materialized_log_data,
+            resolved_attached_functions,
         })
+    }
+
+    async fn finish_stale_work_items(
+        work_queue_client: Option<crate::work_queue::work_queue_client::WorkQueueClient>,
+        attached_function_id: AttachedFunctionUuid,
+        stale_work_items: &[(CollectionUuid, i64)],
+    ) -> Result<(), CompactionError> {
+        if stale_work_items.is_empty() {
+            return Ok(());
+        }
+
+        let Some(mut work_queue_client) = work_queue_client else {
+            return Err(CompactionError::InvariantViolation(
+                "fn-consumer stale work cleanup requires a work queue client",
+            ));
+        };
+
+        for (collection_id, completion_offset) in stale_work_items {
+            work_queue_client
+                .finish_work(
+                    attached_function_id.to_string(),
+                    collection_id.to_string(),
+                    *completion_offset,
+                )
+                .await
+                .map_err(|_| {
+                    CompactionError::InvariantViolation(
+                        "Failed to clear stale fn-consumer work queue entry",
+                    )
+                })?;
+        }
+
+        Ok(())
     }
 
     async fn resolve_shared_input_database_name(
         compaction_context: CompactionContext,
-        fn_inputs: &[(CollectionUuid, i64)],
+        fn_inputs: &[FunctionExecutionInput],
     ) -> Result<DatabaseName, CompactionError> {
-        let Some((first_input_collection_id, _)) = fn_inputs.first() else {
+        let Some(first_input) = fn_inputs.first() else {
             return Err(CompactionError::InvariantViolation(
                 "Function execution requires at least one input collection",
             ));
@@ -141,7 +178,7 @@ impl FunctionExecutionContext {
         // do not carry the database name. Pass the database name from the work queue
         // service and remove this unscoped lookup once that metadata is available.
         let collection_info = sysdb
-            .get_collection_with_segments(None, *first_input_collection_id)
+            .get_collection_with_segments(None, first_input.collection_id)
             .await
             .map_err(|_| {
                 CompactionError::InvariantViolation(
@@ -158,7 +195,7 @@ impl FunctionExecutionContext {
     pub async fn run(
         self,
         attached_function_id: AttachedFunctionUuid,
-        fn_inputs: Vec<(CollectionUuid, i64)>,
+        fn_inputs: Vec<FunctionExecutionInput>,
         system: System,
     ) -> Result<CompactionResponse, CompactionError> {
         if fn_inputs.is_empty() {
@@ -171,17 +208,51 @@ impl FunctionExecutionContext {
         let shared_database_name =
             Self::resolve_shared_input_database_name(base_context.clone(), &fn_inputs).await?;
         let mut input_collection_data = Vec::with_capacity(fn_inputs.len());
-        for (collection_id, completion_offset) in fn_inputs {
-            input_collection_data.push(
-                Box::pin(Self::fetch_function_input_collection_data(
-                    base_context.clone(),
-                    collection_id,
+        let mut stale_work_items = Vec::new();
+        for input in fn_inputs {
+            let collection_data = Box::pin(Self::fetch_function_input_collection_data(
+                base_context.clone(),
+                input.collection_id,
+                attached_function_id,
+                shared_database_name.clone(),
+                system.clone(),
+            ))
+            .await?;
+
+            let completion_offset = collection_data
+                .resolved_attached_functions
+                .iter()
+                .find(|attached_function| attached_function.id == attached_function_id)
+                .map(|attached_function| attached_function.completion_offset as i64)
+                .ok_or(CompactionError::InvariantViolation(
+                    "Missing resolved attached function state for fn-consumer input collection",
+                ))?;
+
+            if completion_offset >= input.queue_compaction_offset {
+                tracing::info!(
+                    collection_id = %input.collection_id,
                     completion_offset,
-                    shared_database_name.clone(),
-                    system.clone(),
-                ))
-                .await?,
-            );
+                    queue_compaction_offset = input.queue_compaction_offset,
+                    "Skipping stale fn-consumer work item because attached function is already at or beyond the queued frontier"
+                );
+                stale_work_items.push((input.collection_id, completion_offset));
+                continue;
+            }
+
+            input_collection_data.push(collection_data);
+        }
+
+        Self::finish_stale_work_items(
+            base_context.work_queue_client.clone(),
+            attached_function_id,
+            &stale_work_items,
+        )
+        .await?;
+
+        if input_collection_data.is_empty() {
+            return Ok(CompactionResponse::Success {
+                job_id: attached_function_id.into(),
+            });
         }
 
         let mut compaction_context = base_context;
