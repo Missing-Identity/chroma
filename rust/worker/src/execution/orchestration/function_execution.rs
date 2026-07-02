@@ -42,6 +42,10 @@ pub struct FunctionExecutionContext {
     compaction_context: CompactionContext,
 }
 
+fn has_reached_queue_frontier(completion_offset: i64, queue_compaction_offset: i64) -> bool {
+    queue_compaction_offset > 0 && completion_offset >= queue_compaction_offset
+}
+
 impl FunctionExecutionContext {
     pub fn new(compaction_context: &CompactionContext) -> Self {
         Self {
@@ -194,7 +198,7 @@ impl FunctionExecutionContext {
                     "Missing resolved attached function state for fn-consumer input collection",
                 ))?;
 
-            if completion_offset >= input.queue_compaction_offset {
+            if has_reached_queue_frontier(completion_offset, input.queue_compaction_offset) {
                 tracing::info!(
                     collection_id = %input.collection_id,
                     completion_offset,
@@ -236,5 +240,20 @@ impl FunctionExecutionContext {
         Ok(CompactionResponse::Success {
             job_id: attached_function_id.into(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_reached_queue_frontier;
+
+    #[test]
+    fn zero_queue_frontier_is_not_treated_as_completed_work() {
+        assert!(!has_reached_queue_frontier(0, 0));
+    }
+
+    #[test]
+    fn positive_queue_frontier_still_treats_equality_as_complete() {
+        assert!(has_reached_queue_frontier(40, 40));
     }
 }
